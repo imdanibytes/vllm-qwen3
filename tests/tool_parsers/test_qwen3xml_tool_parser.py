@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 
 import pytest
 
@@ -8,6 +9,11 @@ from tests.tool_parsers.common_tests import (
     ToolParserTestConfig,
     ToolParserTests,
 )
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+)
+from vllm.tool_parsers.qwen3xml_tool_parser import Qwen3XMLToolParser
 
 
 class TestQwen3xmlToolParser(ToolParserTests):
@@ -70,3 +76,85 @@ class TestQwen3xmlToolParser(ToolParserTests):
             },
             supports_typed_arguments=False,
         )
+
+
+def test_extract_tool_calls_resolves_anyof_array_argument():
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "send_message",
+                "description": "Send a message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "images": {
+                            "anyOf": [
+                                {"type": "array", "items": {"type": "string"}},
+                                {"type": "string"},
+                                {"type": "null"},
+                            ],
+                        },
+                    },
+                    "required": ["text"],
+                },
+            },
+        )
+    ]
+    parser = Qwen3XMLToolParser(tokenizer=object(), tools=tools)
+    request = ChatCompletionRequest(messages=[], model="test-model", tools=tools)
+
+    result = parser.extract_tool_calls(
+        '<tool_call>\n<function=send_message>\n'
+        "<parameter=text>pic</parameter>\n"
+        '<parameter=images>["/data/files/a.png"]</parameter>\n'
+        "</function>\n</tool_call>",
+        request=request,
+    )
+
+    assert result.tools_called
+    assert result.tool_calls is not None
+    arguments = json.loads(result.tool_calls[0].function.arguments)
+    assert arguments["images"] == ["/data/files/a.png"]
+
+
+def test_extract_tool_calls_resolves_anyof_string_argument():
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "send_message",
+                "description": "Send a message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "images": {
+                            "anyOf": [
+                                {"type": "array", "items": {"type": "string"}},
+                                {"type": "string"},
+                                {"type": "null"},
+                            ],
+                        },
+                    },
+                    "required": ["text"],
+                },
+            },
+        )
+    ]
+    parser = Qwen3XMLToolParser(tokenizer=object(), tools=tools)
+    request = ChatCompletionRequest(messages=[], model="test-model", tools=tools)
+
+    result = parser.extract_tool_calls(
+        "<tool_call>\n<function=send_message>\n"
+        "<parameter=text>pic</parameter>\n"
+        "<parameter=images>/data/files/a.png</parameter>\n"
+        "</function>\n</tool_call>",
+        request=request,
+    )
+
+    assert result.tools_called
+    assert result.tool_calls is not None
+    arguments = json.loads(result.tool_calls[0].function.arguments)
+    assert arguments["images"] == "/data/files/a.png"

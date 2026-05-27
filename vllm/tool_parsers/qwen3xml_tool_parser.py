@@ -530,7 +530,9 @@ class StreamingXMLToolCallParser:
                 if self._pre_param_buffer == "":
                     # Get current parameter type
                     param_type = (
-                        self._get_param_type(self._pre_current_param_name)
+                        self._get_param_type(
+                            self._pre_current_param_name, original_chunk
+                        )
                         if self._pre_current_param_name
                         else "string"
                     )
@@ -724,12 +726,15 @@ class StreamingXMLToolCallParser:
                 self.current_param_value += original_data
                 return
 
-            param_type = self._get_param_type(self.current_param_name)
-
             # Check if this is the first time receiving data for this parameter
             # If this is the first packet of data and starts with \n, remove \n
             if not self.current_param_value and data.startswith("\n"):
                 data = data[1:]
+
+            candidate_param_value = self.current_param_value + data
+            param_type = self._get_param_type(
+                self.current_param_name, candidate_param_value
+            )
 
             # Output start quote for string type (if not already output)
             if (
@@ -853,7 +858,7 @@ class StreamingXMLToolCallParser:
                 self.deferred_param_raw_value = ""
                 return
 
-            param_type = self._get_param_type(param_name)
+            param_type = self._get_param_type(param_name, param_value)
 
             # convert complete parameter value by param_type
             converted_value = self._convert_param_value(param_value, param_type)
@@ -990,10 +995,12 @@ class StreamingXMLToolCallParser:
 
         return None
 
-    def _get_param_type(self, param_name: str) -> str:
+    def _get_param_type(self, param_name: str, raw_value: str | None = None) -> str:
         """Get parameter type based on tool configuration, defaults to string
         Args:
             param_name: Parameter name
+            raw_value: Current raw parameter value, if available. This is used
+                to resolve JSON Schema unions like anyOf/oneOf.
 
         Returns:
             Parameter type
@@ -1003,10 +1010,76 @@ class StreamingXMLToolCallParser:
 
         properties = find_tool_properties(self.tools, self.current_function_name)
         if param_name in properties and isinstance(properties[param_name], dict):
-            return self.repair_param_type(
-                str(properties[param_name].get("type", "string"))
-            )
+            return self._resolve_param_type(properties[param_name], raw_value)
         return "string"
+
+    def _resolve_param_type(
+        self, param_schema: dict[str, Any], raw_value: str | None = None
+    ) -> str:
+        """Resolve the best parser type for a JSON Schema parameter."""
+        candidate_types: list[str] = []
+
+        schema_type = param_schema.get("type")
+        if isinstance(schema_type, str):
+            candidate_types.append(schema_type)
+        elif isinstance(schema_type, list):
+            candidate_types.extend(str(item) for item in schema_type)
+
+        for union_key in ("anyOf", "oneOf"):
+            union_schemas = param_schema.get(union_key)
+            if isinstance(union_schemas, list):
+                for union_schema in union_schemas:
+                    if not isinstance(union_schema, dict):
+                        continue
+                    union_type = union_schema.get("type")
+                    if isinstance(union_type, str):
+                        candidate_types.append(union_type)
+                    elif isinstance(union_type, list):
+                        candidate_types.extend(str(item) for item in union_type)
+
+        if not candidate_types:
+            candidate_types.append("string")
+
+        repaired_types: list[str] = []
+        for candidate_type in candidate_types:
+            repaired_type = self.repair_param_type(candidate_type)
+            if repaired_type not in repaired_types:
+                repaired_types.append(repaired_type)
+
+        return self._choose_param_type(repaired_types, raw_value)
+
+    def _choose_param_type(
+        self, candidate_types: list[str], raw_value: str | None = None
+    ) -> str:
+        non_null_types = [
+            param_type
+            for param_type in candidate_types
+            if param_type not in ["null", "none"]
+        ]
+        if not non_null_types:
+            return "string"
+
+        raw = raw_value.lstrip() if raw_value is not None else ""
+        if raw.startswith("["):
+            for param_type in non_null_types:
+                if (
+                    param_type in ["array", "arr", "sequence"]
+                    or param_type.startswith("list")
+                ):
+                    return param_type
+        if raw.startswith("{"):
+            for param_type in non_null_types:
+                if param_type == "object" or param_type.startswith("dict"):
+                    return param_type
+        if raw.lower() == "null":
+            return "string"
+
+        string_types = ["string", "str", "text", "varchar", "char", "enum"]
+        for param_type in non_null_types:
+            if param_type in string_types:
+                return param_type
+
+        return non_null_types[0]
 
     def repair_param_type(self, param_type: str) -> str:
         """Repair unknown parameter types by treating them as string
