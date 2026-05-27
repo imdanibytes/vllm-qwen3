@@ -648,12 +648,15 @@ class OpenAIServing:
             and request.tool_choice == "required"
             and (tool_parser_cls is None or tool_parser_cls.supports_required_and_named)
         ):
-            # "required" with standard JSON-based parsing
+            # "required" with standard JSON-based parsing. Some parser-backed
+            # models, including Qwen XML tool-call templates, still emit parser
+            # syntax for required calls. If JSON parsing finds no calls, fall
+            # back to the configured tool parser before clearing content.
             tool_calls = []
+            original_content = content or ""
             with contextlib.suppress(ValidationError):
-                content = content or ""
                 tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                    content
+                    original_content
                 )
             for tool_call in tool_calls:
                 function_calls.append(
@@ -662,7 +665,36 @@ class OpenAIServing:
                         arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
                     )
                 )
-            content = None  # Clear content since tool is called.
+            if not function_calls and tool_parser_cls and enable_auto_tools:
+                if tokenizer is None:
+                    raise ValueError(
+                        "Tokenizer not available when `skip_tokenizer_init=True`"
+                    )
+                try:
+                    tool_parser = tool_parser_cls(tokenizer, request.tools)
+                except RuntimeError as e:
+                    logger.exception("Error in tool parser creation.")
+                    raise e
+                tool_call_info = tool_parser.extract_tool_calls(
+                    original_content,
+                    request=request,  # type: ignore
+                )
+                if tool_call_info is not None and tool_call_info.tools_called:
+                    function_calls.extend(
+                        FunctionCall(
+                            id=tool_call.id,
+                            name=tool_call.function.name,
+                            arguments=tool_call.function.arguments,
+                        )
+                        for tool_call in tool_call_info.tool_calls
+                    )
+                    content = tool_call_info.content
+                    if content and content.strip() == "":
+                        content = None
+                else:
+                    content = None
+            else:
+                content = None  # Clear content since tool is called.
         elif tool_parser_cls and (
             use_mistral_tool_parser
             or (
