@@ -2,3 +2,6 @@ FROM vllm/vllm-openai:latest
 
 COPY vllm/entrypoints/openai/engine/serving.py \
   /usr/local/lib/python3.12/site-packages/vllm/entrypoints/openai/engine/serving.py
+
+COPY vllm/tool_parsers/qwen3xml_tool_parser.py \
+  /usr/local/lib/python3.12/site-packages/vllm/tool_parsers/qwen3xml_tool_parser.py
